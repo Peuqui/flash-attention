@@ -149,12 +149,53 @@ Ton: Dank + Zahlen als Geschenk. Inhalte:
 
 1. Dank für den SM70-Stack (XQA-Verify trägt unsere Produktion).
 2. Split-KV-Befund aus PR A — falls für künftige FA-Anleihen relevant.
-3. Messungen an flash_attn_v100 (v1.3.0, V100, H=4/HK=1/D=128, 31k KV):
+3. **QSA-Kernel auf Pre-Ampere (der gewichtigste Befund).** Die
+   Dispatch-Tabelle in `qwen4_exp/*/ops/qsa.py` traegt den Kommentar
+   „Tuned on GB300" und wird auf sm70/sm75 unveraendert benutzt. Zwei
+   Warps koennen die emulierte bf16-Latenz auf diesen Karten nicht
+   verstecken. Gemessen am 2048er-Prefill-Chunk (Produktionsgeometrie
+   H12/KV1/D256, TOPK 2048, Harness tools/qsa_bench.py):
+
+   | Karte | GB300-Profil | bestes Pre-Ampere-Profil | Faktor |
+   |---|---:|---:|---:|
+   | V100 (96 KB Smem) | 527 ms (N64/S1/W2) | 27,3 ms (N16/S1/W4) | 19,3 |
+   | RTX 8000 (64 KB) | 199,7 ms (geklammert N32/W2) | 47,9 ms (N16/S4/W4) | 4,2 |
+
+   Die Decode-/Verify-Zweige (`base_programs < 32`) sind bereits optimal
+   und bleiben unangetastet; betroffen ist nur der Prefill-Ast. Wichtig
+   fuer die Reproduktion: Pre-Ampere nimmt laut `qwen4_exp/__init__.py`
+   den `amd/`-Zweig, die `nvidia/`-Zwillingsdatei ist dort tot.
+
+   End-to-end am Flash-Next-180B (TP2xPP2, 262k Kontext): Prefill
+   392-448 -> 1.482-1.696 tok/s, TTFT im kalten Turn 67 -> 25 s,
+   Kohaerenz 3/3. Numerisch unauffaellig: 9,77e-04 max. Abweichung
+   gegen den Produktionspfad, waehrend der Kernel schon gegen sich
+   selbst um 4,88e-04 streut (Reduktionsreihenfolge der Splits) — also
+   1-2 ULP in bf16. Ein A/B mit identischen Prompts zeigt zudem keinen
+   Qualitaetsunterschied (Details unten).
+
+   Patch-Vorschlag: eine Capability-Verzweigung vor der GB300-Tabelle,
+   die fuer `compute_capability < 8` und `base_programs >= 32` auf
+   schmale 4-Warp-Kacheln geht (16/8/4, 16/4/4, 16/1/4 je nach
+   `base_programs`). Wir fahren das produktiv; Diff auf Anfrage oder als
+   PR.
+
+4. **Beobachtung zur Modellqualitaet (kein Kernel-Thema, aber vielleicht
+   nuetzlich).** Qwen3.8-Flash-Next-180B-NVFP4 zerfaellt bei langer
+   Generierung sprachlich: Wortverstuemmelungen und vereinzelte
+   chinesische Zeichen haeufen sich reproduzierbar im letzten Viertel
+   langer Antworten, waehrend der fachliche Inhalt korrekt bleibt (und
+   AIME26 pass@1 bei 98,75 % liegt). Wir haben das gegen beide
+   Kernel-Varianten geprueft — es tritt identisch auf, haengt also nicht
+   an der Attention. Falls ihr aehnliche Beobachtungen habt, waere ein
+   Abgleich interessant.
+
+5. Messungen an flash_attn_v100 (v1.3.0, V100, H=4/HK=1/D=128, 31k KV):
    - Verify skaliert linear mit q (0,153/0,222/0,632 ms für q=1/2/8):
      tokens-as-batch läuft den KV pro Token; ein gebündelter
      Mehr-Token-Verify wäre der nächste große Hebel.
    - Prefill-Kachel D=128: 64×80 statt 32×176 misst 14,06 statt
      16,10 ms (−13 %) am 2048er-Chunk; M muss Vielfaches von 32 sein,
      48×112/80×48 liefern falsche Ergebnisse.
-4. Heterogener Betrieb (RTX-8000-Stufe + V100-Stufe im PP-Gitter)
+6. Heterogener Betrieb (RTX-8000-Stufe + V100-Stufe im PP-Gitter)
    funktioniert mit per-Device-FA-Detection — Hinweis auf PR B.
