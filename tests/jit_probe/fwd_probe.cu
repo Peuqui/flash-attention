@@ -20,6 +20,9 @@ using namespace FLASH_NAMESPACE;
 #ifndef PROBE_BLOCK_N
 #define PROBE_BLOCK_N 64
 #endif
+#ifndef PROBE_WARPS
+#define PROBE_WARPS 4
+#endif
 
 std::vector<torch::Tensor> probe_fwd(torch::Tensor q, torch::Tensor k,
                                      torch::Tensor v, double softmax_scale) {
@@ -218,8 +221,83 @@ std::vector<torch::Tensor> probe_varlen(torch::Tensor q, torch::Tensor k,
     return {out, lse};
 }
 
+
+std::vector<torch::Tensor> probe_splitkv_traits(
+        torch::Tensor q, torch::Tensor k, torch::Tensor v,
+        torch::Tensor block_table, torch::Tensor seqused_k,
+        int64_t max_seqlen_k, double softmax_scale, int64_t num_splits) {
+    // q (total_q, h, d) fuer EINE Sequenz; k/v (num_blocks, block, hk, d)
+    auto total_q = q.size(0), h = q.size(1), d = q.size(2);
+    auto hk = k.size(2);
+    TORCH_CHECK(d == PROBE_HEADDIM, "headdim mismatch");
+
+    auto out = torch::zeros_like(q);
+    auto lse = torch::empty({1, h, total_q}, q.options().dtype(torch::kFloat32));
+    auto lse_accum = torch::full({num_splits, 1, h, total_q}, -INFINITY,
+                                 q.options().dtype(torch::kFloat32));
+    auto out_accum = torch::zeros({num_splits, 1, h, total_q, d},
+                                  q.options().dtype(torch::kFloat32));
+
+    Flash_fwd_params params{};
+    params.is_bf16 = false;
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.o_ptr = out.data_ptr();
+    params.softmax_lse_ptr = lse.data_ptr();
+    params.softmax_lseaccum_ptr = lse_accum.data_ptr();
+    params.oaccum_ptr = out_accum.data_ptr();
+    params.q_row_stride = q.stride(0);
+    params.k_row_stride = k.stride(1);
+    params.v_row_stride = v.stride(1);
+    params.o_row_stride = out.stride(0);
+    params.q_head_stride = q.stride(1);
+    params.k_head_stride = k.stride(2);
+    params.v_head_stride = v.stride(2);
+    params.o_head_stride = out.stride(1);
+    params.q_batch_stride = 0;
+    params.k_batch_stride = k.stride(0);
+    params.v_batch_stride = v.stride(0);
+    params.o_batch_stride = 0;
+    params.block_table = static_cast<int*>(block_table.data_ptr());
+    params.block_table_batch_stride = block_table.stride(0);
+    params.page_block_size = k.size(1);
+    params.seqused_k = static_cast<int*>(seqused_k.data_ptr());
+    params.b = 1;
+    params.h = h;
+    params.h_k = hk;
+    params.h_h_k_ratio = h / hk;
+    params.seqlen_q = total_q;
+    params.seqlen_k = max_seqlen_k;
+    params.seqlen_q_rounded = (total_q + 127) / 128 * 128;
+    params.seqlen_k_rounded = (max_seqlen_k + 127) / 128 * 128;
+    params.d = d;
+    params.d_rounded = d;
+    params.scale_softmax = softmax_scale;
+    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
+    params.softcap = 0.f;
+    params.p_dropout = 1.f;
+    params.p_dropout_in_uint8_t = 255;
+    params.rp_dropout = 1.f;
+    params.scale_softmax_rp_dropout = params.scale_softmax;
+    params.is_causal = true;
+    params.window_size_left = -1;
+    params.window_size_right = 0;
+    params.is_seqlens_k_cumulative = true;
+    params.unpadded_lse = false;
+    params.num_splits = num_splits;
+
+    using T = cutlass::half_t;
+    run_flash_splitkv_fwd<
+        Flash_fwd_kernel_traits<PROBE_HEADDIM, PROBE_BLOCK_M, PROBE_BLOCK_N,
+                                PROBE_WARPS, false, false, T>,
+        /*Is_causal=*/true>(params, at::cuda::getCurrentCUDAStream());
+    return {out, lse};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("probe_fwd", &probe_fwd, "flash fwd probe");
     m.def("probe_splitkv", &probe_splitkv, "flash splitkv probe");
     m.def("probe_varlen", &probe_varlen, "flash varlen fwd probe");
+    m.def("probe_splitkv_traits", &probe_splitkv_traits, "splitkv with explicit traits");
 }
