@@ -184,6 +184,16 @@ if (FA2_ENABLED)
         USE_SABI 3
         WITH_SOABI)
 
+    # A second FA2 build for another architecture (e.g. a Turing build next to
+    # a Volta one) needs a distinct file name. The Python module name and the
+    # op namespace stay _vllm_fa2_C: vLLM loads exactly one FA2 library per
+    # process, chosen by the device it runs on, under that module name.
+    set(VLLM_FA2_OUTPUT_NAME "" CACHE STRING
+        "Override the file name of the _vllm_fa2_C extension (e.g. _vllm_fa2_C_sm75)")
+    if(VLLM_FA2_OUTPUT_NAME)
+        set_target_properties(_vllm_fa2_C PROPERTIES OUTPUT_NAME "${VLLM_FA2_OUTPUT_NAME}")
+    endif()
+
     target_include_directories(_vllm_fa2_C PRIVATE
         csrc/flash_attn
         csrc/flash_attn/src
