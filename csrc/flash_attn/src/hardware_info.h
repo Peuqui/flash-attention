@@ -39,3 +39,9 @@ inline int get_num_sm(int device) {
     CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
     return multiprocessor_count;
 }
+
+inline int get_max_shared_memory_per_sm(int device) {
+    int shared_memory_bytes;
+    CHECK_CUDA(cudaDeviceGetAttribute(&shared_memory_bytes, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
+    return shared_memory_bytes;
+}

@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -298,19 +299,17 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     });
 }
 
-// Find the number of splits that maximizes the occupancy. For example, if we have
-// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-// splits as that would incur more HBM reads/writes.
-// So we find the best efficiency, then find the smallest number of splits that gets 85%
-// of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+// Choose the number of KV splits of a split-KV launch. The grid has batch_nheads_mblocks * num_splits CTAs and
+// `ctas_per_wave` of them (SMs x resident CTAs per SM) run at once. A CTA streams its KV blocks at a rate that does not
+// depend on the split count, so the launch takes ceil(CTAs / ctas_per_wave) waves of ceil(num_n_blocks / num_splits)
+// blocks. Pick the split count with the shortest such time; among the counts within 1 % of it, the smallest, which
+// keeps the partial results the combine kernel reads few. (RTX 8000, head size 256, 2 KV heads, 236k tokens: the former
+// rule of "85 % of the best wave efficiency" chose 62 splits = 124 CTAs on 72 SMs, a second wave of 52 CTAs and 1.49 ms;
+// 36 splits fill one wave exactly and take 1.30 ms; 37 splits start a second wave of 2 CTAs and take 2.18 ms.)
+inline int num_splits_heuristic(int batch_nheads_mblocks, int ctas_per_wave, int num_n_blocks, int max_splits) {
     // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
+    if (batch_nheads_mblocks >= 0.8f * ctas_per_wave) { return 1; }
+    max_splits = std::min(max_splits, num_n_blocks);
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
     // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
     // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
@@ -319,25 +318,28 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
         return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
     };
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
-        } else {
-            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-            float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-            if (eff > max_efficiency) { max_efficiency = eff; }
-            efficiency.push_back(eff);
-        }
+    auto blocks_streamed = [&](int num_splits) {  // KV blocks one SM streams in sequence: waves x blocks per split
+        return ceildiv(batch_nheads_mblocks * num_splits, ctas_per_wave) * ceildiv(num_n_blocks, num_splits);
+    };
+    int shortest = blocks_streamed(1);
+    for (int num_splits = 2; num_splits <= max_splits; num_splits++) {
+        if (is_split_eligible(num_splits)) { shortest = std::min(shortest, blocks_streamed(num_splits)); }
     }
+    constexpr int kTolerancePercent = 1;
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
+        if (is_split_eligible(num_splits) && blocks_streamed(num_splits) * 100 <= shortest * (100 + kTolerancePercent)) {
             return num_splits;
         }
     }
     return 1;
+}
+
+// CTAs of the split-KV kernel that fit on one SM, limited by its shared memory: the Q tile plus the K and V tiles at
+// 2 bytes per element (Flash_fwd_kernel_traits without Q/K sharing). Capped at 2, the count the heuristic used to assume
+// for every kernel; hdim 256 on Turing (64 x 32 tiles, exactly 64 KB) runs 1 CTA per SM.
+inline int splitkv_ctas_per_sm(int block_m, int block_n, int head_size_rounded, int max_shared_memory_per_sm) {
+    const int shared_memory_bytes = (block_m + 2 * block_n) * head_size_rounded * 2;
+    return std::max(1, std::min(2, max_shared_memory_per_sm / shared_memory_bytes));
 }
 
 std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
@@ -361,8 +363,10 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
-            // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+            const int ctas_per_sm = splitkv_ctas_per_sm(
+                64, block_n, head_size_rounded, get_max_shared_memory_per_sm(get_current_device()));
+            params.num_splits = num_splits_heuristic(
+                batch_size * num_heads * num_m_blocks, num_sm * ctas_per_sm, num_n_blocks, 128);
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::stable::new_empty(ref, {params.num_splits, batch_size, num_heads, max_seqlen_q}, ScalarType::Float);
